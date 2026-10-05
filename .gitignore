@@ -1,0 +1,40 @@
+# Зависимости
+node_modules/
+.pnpm-store/
+
+# Сборка
+dist/
+build/
+*.tsbuildinfo
+
+# Окружение и секреты
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# База данных и её служебные файлы
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Резервные копии (A44)
+backend/var/backups/
+
+# Загруженные файлы (STORAGE_DIR)
+backend/var/storage/
+
+# Логи и временное
+*.log
+npm-debug.log*
+coverage/
+
+# Документы заказчика (ТЗ) — не публикуются
+*_TZ_*.docx
+
+# Редакторы и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

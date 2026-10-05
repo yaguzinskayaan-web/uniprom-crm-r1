@@ -1,0 +1,2133 @@
+openapi: 3.0.3
+
+info:
+  title: UNIPROM CRM API
+  version: 1.0.0
+  description: |
+    HTTP API CRM для обработки заявок на изготовление изделий.
+
+    Два взаимозаменяемых префикса с одинаковой серверной проверкой прав и области
+    видимости: канонический `/api/v1/...` и контрактный `/api/v1/crm/...`.
+
+    Аутентификация — JWT в заголовке `Authorization: Bearer <token>`.
+    Технические эндпоинты дополнительно требуют заголовок `x-integration-token`.
+
+    Создание заявки принимает заголовок `Idempotency-Key`. Изменение ресурса
+    требует `lockVersion`; при конфликте возвращается 409 `VERSION_CONFLICT`.
+  contact:
+    name: UNIPROM
+
+servers:
+  - url: http://127.0.0.1:3001
+    description: Локальный backend
+
+tags:
+  - name: auth
+    description: Аутентификация
+  - name: applications
+    description: Заявки
+  - name: tasks
+    description: Задачи и коммуникации
+  - name: quotes
+    description: Коммерческие предложения
+  - name: engineering
+    description: Конструкторский отдел
+  - name: production
+    description: Выпуск, исполнение и закрытие
+  - name: imports
+    description: Импорт данных
+  - name: integrations
+    description: Обмен с 1С и почтой
+  - name: analytics
+    description: Аналитика
+  - name: admin
+    description: Администрирование
+
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Вход в систему
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [login, password]
+              properties:
+                login: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Токен и профиль
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '423': { $ref: '#/components/responses/Locked' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Выход
+      responses:
+        '204': { description: Токен отозван }
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Профиль текущего пользователя
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/password:
+    post:
+      tags: [auth]
+      summary: Смена пароля
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string, format: password }
+                newPassword: { type: string, format: password, minLength: 8 }
+      responses:
+        '200': { description: Пароль изменён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/applications:
+    get:
+      tags: [applications]
+      summary: Список заявок в области видимости
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: stage
+          in: query
+          schema: { type: string }
+        - name: complexity
+          in: query
+          schema: { type: string, enum: [STANDARD, MODIFIED, CUSTOM, NEEDS_CLASSIFICATION] }
+        - name: ownerId
+          in: query
+          schema: { type: string }
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Постраничный список
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PagedApplications' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [applications]
+      summary: Создание заявки
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationCreate' }
+      responses:
+        '201':
+          description: Заявка создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationCreateResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/applications/{number}:
+    get:
+      tags: [applications]
+      summary: Карточка заявки
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Заявка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Application' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [applications]
+      summary: Изменение заявки
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationUpdate' }
+      responses:
+        '200':
+          description: Заявка изменена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Application' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/applications/{number}/stage:
+    post:
+      tags: [applications]
+      summary: Перевод заявки на другой этап
+      description: |
+        Переход проверяется по диаграмме этапов. Цели `TO_PRODUCTION` и `CLOSED`
+        защищены: перейти в них обычным способом нельзя — только через проверку
+        выпуска и через отдельное действие закрытия.
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stage, lockVersion]
+              properties:
+                stage: { type: string }
+                comment: { type: string }
+                lossReasonCode: { type: string }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Этап изменён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/applications/{number}/assign:
+    post:
+      tags: [applications]
+      summary: Назначение исполнителя
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assigneeId]
+              properties:
+                assigneeId: { type: string }
+                comment: { type: string }
+                moveOpenTasks: { type: boolean, default: false }
+      responses:
+        '200': { description: Назначение выполнено, создана история и уведомления }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/applications/{number}/complexity:
+    post:
+      tags: [applications]
+      summary: Подтверждение сложности
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [complexity, lockVersion]
+              properties:
+                complexity:
+                  type: string
+                  enum: [STANDARD, MODIFIED, CUSTOM, NEEDS_CLASSIFICATION]
+                comment: { type: string }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Сложность подтверждена, заключения КО перепроверяются }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/applications/{number}/timeline:
+    get:
+      tags: [applications]
+      summary: Лента событий заявки
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: События по убыванию времени
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TimelineEvent' }
+
+  /api/v1/tasks:
+    get:
+      tags: [tasks]
+      summary: Задачи в области видимости
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: applicationNumber
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Постраничный список задач
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Task' }
+                  total: { type: integer }
+
+  /api/v1/my-work:
+    get:
+      tags: [tasks]
+      summary: Мои задачи
+      responses:
+        '200': { description: Задачи текущего пользователя }
+
+  /api/v1/tasks/{taskId}:
+    patch:
+      tags: [tasks]
+      summary: Изменение задачи
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lockVersion]
+              properties:
+                title: { type: string }
+                description: { type: string }
+                dueAt: { type: string, format: date-time }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Задача изменена }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/tasks/{taskId}/complete:
+    post:
+      tags: [tasks]
+      summary: Закрытие задачи
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200': { description: Задача закрыта }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/tasks/{taskId}/cancel:
+    post:
+      tags: [tasks]
+      summary: Отмена задачи
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200': { description: Задача отменена }
+
+  /api/v1/applications/{number}/activities:
+    get:
+      tags: [tasks]
+      summary: Коммуникации по заявке
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Коммуникации
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Activity' }
+    post:
+      tags: [tasks]
+      summary: Добавление коммуникации
+      description: |
+        Для клиентской коммуникации обновляется время последнего контакта и
+        снимается блокировка «нет коммерческой активности». Технические события
+        помечаются `isCustomerFacing: false` и этот контроль не сбрасывают.
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, body]
+              properties:
+                type: { type: string }
+                body: { type: string }
+                isCustomerFacing: { type: boolean, default: true }
+      responses:
+        '201': { description: Коммуникация создана }
+
+  /api/v1/applications/{number}/quotes:
+    get:
+      tags: [quotes]
+      summary: Версии КП по заявке
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Версии
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Quote' }
+    post:
+      tags: [quotes]
+      summary: Создание версии КП
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                amount: { type: number }
+                currency: { type: string }
+                discountPct: { type: number }
+                taxPct: { type: number }
+                validUntil: { type: string, format: date-time }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      lineId: { type: string }
+                      name: { type: string }
+                      quantity: { type: number }
+                      price: { type: number }
+      responses:
+        '201': { description: Версия создана }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/quotes/{quoteId}:
+    get:
+      tags: [quotes]
+      summary: Версия КП
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      responses:
+        '200':
+          description: Версия КП
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+    patch:
+      tags: [quotes]
+      summary: Изменение версии КП
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lockVersion]
+              properties:
+                amount: { type: number }
+                currency: { type: string }
+                validUntil: { type: string, format: date-time }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Версия изменена }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/quotes/{quoteId}/generate:
+    post:
+      tags: [quotes]
+      summary: Генерация КП по расчёту
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      responses:
+        '200': { description: Версия сформирована }
+
+  /api/v1/quotes/{quoteId}/upload:
+    post:
+      tags: [quotes]
+      summary: Загрузка файла КП
+      description: Загруженная и сгенерированная версии проходят одинаковые обязательные проверки.
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: Файл прикреплён, версия переведена в READY }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/quotes/{quoteId}/submit-approval:
+    post:
+      tags: [quotes]
+      summary: Отправка КП на согласование
+      description: Проверяется заключение КО для CUSTOM и для MODIFIED с обязательным участием КО.
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      responses:
+        '200': { description: Отправлено руководителю }
+        '422':
+          description: Требуется действующее положительное заключение КО
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/quotes/{quoteId}/approval-decision:
+    post:
+      tags: [quotes]
+      summary: Решение руководителя по КП
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, lockVersion]
+              properties:
+                decision: { type: string, enum: [APPROVED, REJECTED] }
+                comment: { type: string, description: Обязателен при отклонении }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Решение зафиксировано, автор уведомлён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Содержимое изменилось после согласования
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/quotes/{quoteId}/send:
+    post:
+      tags: [quotes]
+      summary: Отправка КП клиенту
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Создано одно почтовое задание }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/quotes/{quoteId}/customer-decision:
+    post:
+      tags: [quotes]
+      summary: Решение клиента по КП
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [ACCEPTED, DECLINED] }
+                comment: { type: string }
+      responses:
+        '200': { description: Решение клиента зафиксировано }
+
+  /api/v1/quotes/{quoteId}/external-send:
+    post:
+      tags: [quotes]
+      summary: Фиксация внешней отправки
+      description: Фиксируются версия, получатель, фактическое время и ручной источник.
+      parameters:
+        - $ref: '#/components/parameters/QuoteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipients, sentAt]
+              properties:
+                recipients:
+                  type: array
+                  items: { type: string }
+                sentAt: { type: string, format: date-time }
+                channel: { type: string }
+      responses:
+        '200': { description: Отправка зафиксирована }
+
+  /api/v1/applications/{number}/commercial-basis-check:
+    get:
+      tags: [quotes]
+      summary: Проверка коммерческого основания
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckResult' }
+
+  /api/v1/engineering/tasks:
+    get:
+      tags: [engineering]
+      summary: Задания конструкторского отдела
+      parameters:
+        - name: applicationNumber
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Задания
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EngineeringTask' }
+
+  /api/v1/applications/{number}/engineering-tasks:
+    post:
+      tags: [engineering]
+      summary: Создание задания КО
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                dueAt: { type: string, format: date-time }
+      responses:
+        '201': { description: Задание создано }
+
+  /api/v1/engineering/tasks/{taskId}/assign:
+    post:
+      tags: [engineering]
+      summary: Назначение конструктора
+      description: Назначать конструктора может только роль, которой это разрешено.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assigneeId]
+              properties:
+                assigneeId: { type: string }
+      responses:
+        '200': { description: Назначено }
+        '403':
+          description: У роли нет права назначать конструктора
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/engineering/tasks/{taskId}/complete:
+    post:
+      tags: [engineering]
+      summary: Завершение задания КО
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200': { description: Задание завершено }
+
+  /api/v1/engineering/tasks/{taskId}/cancel:
+    post:
+      tags: [engineering]
+      summary: Отмена задания КО
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200': { description: Задание отменено }
+
+  /api/v1/engineering/conclusions/{conclusionId}/approve:
+    post:
+      tags: [engineering]
+      summary: Утверждение заключения КО
+      parameters:
+        - name: conclusionId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve, lockVersion]
+              properties:
+                approve: { type: boolean }
+                comment: { type: string }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Решение зафиксировано, заявка уведомлена }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/applications/{number}/production-release-check:
+    get:
+      tags: [production]
+      summary: Проверка допуска к выпуску
+      description: |
+        Возвращает список блокирующих условий: полная или частичная предоплата,
+        постоплата, таможенный режим, заключение КО, коммерческое основание,
+        подписанный договор. Фиктивная оплата не создаётся.
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckResult' }
+
+  /api/v1/applications/{number}/release-approval:
+    post:
+      tags: [production]
+      summary: Ручное разрешение на выпуск
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+                amount: { type: number }
+                currency: { type: string }
+      responses:
+        '201': { description: Разрешение создано, повторная проверка допускает выпуск }
+    delete:
+      tags: [production]
+      summary: Отзыв ручного разрешения
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '204': { description: Разрешение отозвано }
+
+  /api/v1/applications/{number}/fulfilment:
+    get:
+      tags: [production]
+      summary: Состояние исполнения
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Отгрузки, оплаты, остатки по позициям
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Fulfilment' }
+
+  /api/v1/applications/{number}/close-check:
+    get:
+      tags: [production]
+      summary: Проверка возможности закрытия
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Блокирующие условия закрытия
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckResult' }
+
+  /api/v1/applications/{number}/close:
+    post:
+      tags: [production]
+      summary: Закрытие заявки
+      description: |
+        Отдельное действие. Блокируют неполная отгрузка, незавершённая постоплата
+        и отсутствие обязательных документов. При успехе фиксируются время и автор
+        закрытия, событие попадает в историю.
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lockVersion]
+              properties:
+                comment: { type: string }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Заявка закрыта }
+        '409':
+          description: Условия закрытия не выполнены
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckResult' }
+
+  /api/v1/applications/{number}/closing-documents:
+    get:
+      tags: [production]
+      summary: Обязательные закрывающие документы
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      responses:
+        '200':
+          description: Документы и их состояние
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ClosingDocument' }
+    post:
+      tags: [production]
+      summary: Регистрация закрывающего документа
+      parameters:
+        - $ref: '#/components/parameters/Number'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [documentType]
+              properties:
+                documentType: { type: string }
+                documentNumber: { type: string }
+                status: { type: string, enum: [REGISTERED, SIGNED] }
+      responses:
+        '201': { description: Документ зарегистрирован }
+
+  /api/v1/imports/inspect:
+    post:
+      tags: [imports]
+      summary: Разбор загруженного файла
+      description: |
+        Принимает CSV или XLSX, определяет разделитель и колонки, возвращает
+        заголовки и выборку строк. Файл разбирается на сервере, лимит 5000 строк.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Заголовки, выборка и ограничения
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportInspect' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413':
+          description: Превышен лимит строк или размер файла
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/imports/upload:
+    post:
+      tags: [imports]
+      summary: Загрузка файла с сопоставлением колонок
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, mapping]
+              properties:
+                file: { type: string, format: binary }
+                mapping:
+                  type: string
+                  description: JSON-объект вида `{"groupId":"Колонка A", ...}`
+      responses:
+        '200':
+          description: Пакет создан, показан предпросмотр и ошибки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportPreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/imports/validate:
+    post:
+      tags: [imports]
+      summary: Валидация пакета импорта
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, mapping, rows]
+              properties:
+                fileName: { type: string }
+                source: { type: string, example: CSV }
+                mapping:
+                  type: object
+                  additionalProperties: { type: string }
+                rows:
+                  type: array
+                  items: { $ref: '#/components/schemas/ImportRow' }
+      responses:
+        '200':
+          description: Пакет в статусе VALIDATED с предпросмотром
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+
+  /api/v1/imports/{batchId}/commit:
+    post:
+      tags: [imports]
+      summary: Создание заявок из пакета
+      description: |
+        Группа с ошибочной строкой не импортируется целиком. Повторная загрузка
+        принятого пакета не создаёт дублей: ключ идемпотентности заявки строится
+        по содержимому пакета.
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                onlyGroupIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: Результат создания по группам
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportCommitResult' }
+        '400':
+          description: Выбраны группы с ошибками
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/imports:
+    get:
+      tags: [imports]
+      summary: История пакетов импорта
+      responses:
+        '200':
+          description: Последние пакеты
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ImportBatch' }
+
+  /api/v1/imports/{batchId}:
+    get:
+      tags: [imports]
+      summary: Пакет импорта с ошибками по строкам
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Пакет и диагностика
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch: { $ref: '#/components/schemas/ImportBatch' }
+                  issues:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportIssue' }
+                  rows:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportRow' }
+
+  /api/v1/integrations/commercial/sync:
+    post:
+      tags: [integrations]
+      summary: Приём данных из 1С
+      description: |
+        Приём счетов, платежей и отгрузок 1С. Сообщения дедуплицируются по `extId`.
+        Повтор с тем же `extId` и меньшим `versionNo` помечается как устаревшее и не
+        применяется. Счета и отгрузки относятся к заявке из `applicationNumber`.
+        Платёж может быть распределён между несколькими заказами через `allocations`
+        (A29): сумма долей не должна превышать сумму платежа, валюты долей должны
+        совпадать, заказ нельзя указывать дважды. Ответ возвращает `unallocated` —
+        сумму, которую не удалось зачесть ни в один заказ.
+      security:
+        - bearerAuth: []
+        - integrationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [applicationNumber]
+              properties:
+                applicationNumber: { type: string, description: Номер заявки-получателя по умолчанию }
+                invoices:
+                  type: array
+                  description: Счета относятся к заявке из applicationNumber.
+                  items:
+                    type: object
+                    required: [extId, number, amount, currency]
+                    properties:
+                      extId: { type: string }
+                      number: { type: string }
+                      docDate: { type: string, format: date-time }
+                      amount: { type: number }
+                      currency: { type: string, minLength: 3, maxLength: 3 }
+                      status: { type: string }
+                      versionNo: { type: integer, minimum: 1 }
+                payments:
+                  type: array
+                  items:
+                    type: object
+                    required: [extId, amount, currency]
+                    properties:
+                      extId: { type: string }
+                      docDate: { type: string, format: date-time }
+                      amount: { type: number }
+                      currency: { type: string, minLength: 3, maxLength: 3 }
+                      kind: { type: string, enum: [IN, RETURN] }
+                      isCancelled: { type: boolean }
+                      versionNo: { type: integer, minimum: 1 }
+                      allocations:
+                        type: array
+                        minItems: 1
+                        description: |
+                          A29: доли одного платежа по разным заказам. Если поле не
+                          задано, платёж зачитывается целиком в applicationNumber
+                          по счетам в порядке FIFO.
+                        items:
+                          type: object
+                          required: [applicationNumber, amount]
+                          properties:
+                            applicationNumber: { type: string }
+                            amount: { type: number, exclusiveMinimum: 0 }
+                shipments:
+                  type: array
+                  items:
+                    type: object
+                    required: [extId, number]
+                    properties:
+                      extId: { type: string }
+                      number: { type: string }
+                      docDate: { type: string, format: date-time }
+                      status: { type: string }
+                      carrier: { type: string, nullable: true }
+                      waybill: { type: string, nullable: true }
+                      isCancelled: { type: boolean }
+                      versionNo: { type: integer, minimum: 1 }
+                      lines:
+                        type: array
+                        items:
+                          type: object
+                          required: [lineId, quantity]
+                          properties:
+                            lineId: { type: string }
+                            quantity: { type: number }
+                            unit: { type: string }
+                            actualDate: { type: string, format: date-time, nullable: true }
+      responses:
+        '200':
+          description: |
+            Применено. Для платежей возвращаются `allocated`, `unallocated` и
+            `shares` — распределение по заказам (A29).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applicationNumber: { type: string }
+                  invoices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        extId: { type: string }
+                        created: { type: boolean }
+                        status: { type: string }
+                  payments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        extId: { type: string }
+                        paymentId:
+                          type: string
+                          description: |
+                            Идентификатор платежа в CRM. Требуется для ручного зачёта
+                            (`POST /api/v1/applications/:number/payments/allocate`).
+                        created: { type: boolean }
+                        allocated: { type: number, description: Зачтено по счетам }
+                        unallocated:
+                          type: number
+                          description: Остаток, который не удалось зачесть ни в один заказ
+                        cancelled: { type: boolean }
+                        shares:
+                          type: array
+                          description: Доля платежа по каждому заказу (A29)
+                          items:
+                            type: object
+                            properties:
+                              applicationNumber: { type: string }
+                              amount: { type: number }
+                  totals:
+                    type: object
+                    properties:
+                      invoiced: { type: number }
+                      allocated: { type: number }
+                      outstanding: { type: number }
+                  reopened: { type: boolean }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/applications/{number}/payments/allocate:
+    post:
+      tags: [integrations]
+      summary: Ручной зачёт платежа 1С по счёту заявки
+      description: |
+        Применяется, когда поступивший платёж не удалось распределить
+        автоматически. Ошибка ручного зачёта не создаёт оплату — она лишь
+        связывает уже зафиксированный платёж 1С со счётом заявки из пути.
+        Счёт обязателен, должен принадлежать этой заявке и не быть отменённым;
+        его валюта совпадает с валютой платежа, а валюта платежа — с валютой
+        заказа. Сумма всех распределений платежа не должна превышать его сумму.
+        Повторный зачёт того же платежа на тот же счёт отклоняется.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: number
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentId, invoiceId, amount]
+              properties:
+                paymentId: { type: string, description: Идентификатор платежа из ответа commercial/sync }
+                invoiceId: { type: string, description: Счёт именно этой заявки; счёт другой заявки отклоняется }
+                amount: { type: number, exclusiveMinimum: 0 }
+                comment: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Зачёт выполнен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  allocated: { type: number }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/integrations/outbox:
+    get:
+      tags: [integrations]
+      summary: Очередь исходящих событий
+      security:
+        - bearerAuth: []
+        - integrationToken: []
+      parameters:
+        - name: state
+          in: query
+          schema: { type: string, enum: [PENDING, DELIVERED, FAILED, ERROR_QUEUE] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: События с возрастом и числом попыток
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OutboxEvent' }
+
+  /api/v1/integrations/outbox/delivered:
+    post:
+      tags: [integrations]
+      summary: Подтверждение доставки события
+      security:
+        - bearerAuth: []
+        - integrationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [eventId]
+              properties:
+                eventId: { type: string }
+      responses:
+        '200': { description: Событие отмечено доставленным }
+
+  /api/v1/integrations/status:
+    get:
+      tags: [integrations]
+      summary: Состояние интеграций и возраст данных
+      responses:
+        '200':
+          description: Состояние, время последнего обмена, возраст очереди
+
+  /api/v1/integrations/mail/inbound:
+    post:
+      tags: [integrations]
+      summary: Приём входящего письма
+      description: Письмо попадает в очередь и не создаёт заявку до подтверждения.
+      security:
+        - integrationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messageId, from, subject, body]
+              properties:
+                messageId: { type: string }
+                from: { type: string }
+                subject: { type: string }
+                body: { type: string }
+                confirmationToken: { type: string }
+                attachments:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      fileName: { type: string }
+                      contentBase64: { type: string }
+      responses:
+        '200': { description: Письмо принято в очередь }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/mail/inbox:
+    get:
+      tags: [integrations]
+      summary: Очередь входящих писем
+      responses:
+        '200':
+          description: Письма с состоянием разбора
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/InboundMail' }
+
+  /api/v1/mail/{mailId}/create-application:
+    post:
+      tags: [integrations]
+      summary: Создание заявки из письма
+      description: Повторное подтверждение того же письма не создаёт вторую заявку.
+      parameters:
+        - name: mailId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '201': { description: Заявка создана }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/dashboard:
+    get:
+      tags: [analytics]
+      summary: Рабочий стол
+      description: Агрегаты ограничены областью видимости и правами.
+      responses:
+        '200':
+          description: Счётчики, воронка, задачи
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+
+  /api/v1/pipeline:
+    get:
+      tags: [analytics]
+      summary: Воронка
+      responses:
+        '200':
+          description: Этапы и суммы по валютам
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pipeline' }
+
+  /api/v1/analytics/plan-fact:
+    get:
+      tags: [analytics]
+      summary: План-факт
+      description: Суммы по валютам не суммируются между собой.
+      responses:
+        '200':
+          description: План, факт и оплаты по валютам
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlanFact' }
+
+  /api/v1/analytics/applications.csv:
+    get:
+      tags: [analytics]
+      summary: Выгрузка заявок в CSV
+      description: Выгрузка применяет ту же область видимости, что и список.
+      responses:
+        '200':
+          description: CSV
+          content:
+            text/csv:
+              schema: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/sla/rules:
+    get:
+      tags: [admin]
+      summary: Правила SLA
+      responses:
+        '200':
+          description: Правила
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SlaRule' }
+    put:
+      tags: [admin]
+      summary: Обновление правил SLA
+      responses:
+        '200': { description: Правила сохранены }
+
+  /api/v1/sla/instances:
+    get:
+      tags: [admin]
+      summary: Экземпляры SLA
+      responses:
+        '200': { description: Экземпляры с рассчитанными сроками }
+
+  /api/v1/sla/instances/{instanceId}/resume:
+    post:
+      tags: [admin]
+      summary: Возобновление приостановленного SLA
+      parameters:
+        - name: instanceId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Отсчёт возобновлён }
+
+  /api/v1/calendars:
+    get:
+      tags: [admin]
+      summary: Производственный календарь
+      responses:
+        '200': { description: Календарь }
+    put:
+      tags: [admin]
+      summary: Обновление календаря
+      responses:
+        '200': { description: Календарь сохранён }
+
+  /api/v1/users:
+    get:
+      tags: [admin]
+      summary: Список пользователей
+      responses:
+        '200':
+          description: Пользователи
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+                  total: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      summary: Создание пользователя
+      responses:
+        '201': { description: Пользователь создан }
+
+  /api/v1/users/assignable:
+    get:
+      tags: [admin]
+      summary: Кого текущий пользователь может назначать
+      responses:
+        '200':
+          description: Список доступных исполнителей по ролям
+
+  /api/v1/users/{userId}:
+    patch:
+      tags: [admin]
+      summary: Изменение пользователя
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lockVersion]
+              properties:
+                fullName: { type: string }
+                role: { type: string }
+                lockVersion: { type: integer }
+      responses:
+        '200': { description: Пользователь изменён }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/users/{userId}/block:
+    post:
+      tags: [admin]
+      summary: Блокировка пользователя
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [blocked]
+              properties:
+                blocked: { type: boolean }
+                reason: { type: string }
+      responses:
+        '200': { description: Блокировка применена }
+        '400':
+          description: Администратор не может заблокировать себя
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/users/{userId}/reset-password:
+    post:
+      tags: [admin]
+      summary: Сброс пароля пользователя
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200': { description: Пароль сброшен }
+
+  /api/v1/references:
+    get:
+      tags: [admin]
+      summary: Справочники
+      responses:
+        '200': { description: Справочники }
+    put:
+      tags: [admin]
+      summary: Обновление справочников
+      responses:
+        '200': { description: Справочники сохранены }
+
+  /api/v1/audit-events:
+    get:
+      tags: [admin]
+      summary: Журнал аудита
+      description: Технические события видны только ролям с доступом к аудиту.
+      parameters:
+        - name: applicationNumber
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: size
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        '200':
+          description: События аудита
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEvent' }
+                  total: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/files:
+    get:
+      tags: [admin]
+      summary: Список файлов
+      parameters:
+        - name: applicationNumber
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Файлы
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FileObject' }
+    post:
+      tags: [admin]
+      summary: Загрузка файла
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                applicationNumber: { type: string }
+      responses:
+        '201': { description: Файл сохранён }
+
+  /api/v1/files/{fileId}:
+    get:
+      tags: [admin]
+      summary: Скачивание файла
+      description: Чужой файл недоступен и его существование не раскрывается.
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Содержимое файла
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/notifications:
+    get:
+      tags: [tasks]
+      summary: Уведомления
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: size
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        '200':
+          description: Уведомления
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Notification' }
+                  total: { type: integer }
+
+  /api/v1/notifications/{notificationId}/read:
+    post:
+      tags: [tasks]
+      summary: Отметить уведомление прочитанным
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Отмечено }
+
+  /api/v1/notifications/read-all:
+    post:
+      tags: [tasks]
+      summary: Отметить все уведомления прочитанными
+      responses:
+        '200': { description: Отмечены }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    integrationToken:
+      type: apiKey
+      in: header
+      name: x-integration-token
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Size:
+      name: size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: Повтор с тем же ключом не создаёт вторую запись.
+    Number:
+      name: number
+      in: path
+      required: true
+      schema: { type: string }
+      description: Номер заявки.
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: { type: string }
+    QuoteId:
+      name: quoteId
+      in: path
+      required: true
+      schema: { type: string }
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema: { type: string }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Ошибка запроса
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Требуется действительный токен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Недостаточно прав
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Не найдено или вне области видимости
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Конфликт состояния или версии
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Нарушено бизнес-правило
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Превышен лимит частоты запросов
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Locked:
+      description: Вход временно заблокирован после неудачных попыток
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, correlationId]
+      properties:
+        code: { type: string, example: VERSION_CONFLICT }
+        message: { type: string }
+        correlationId: { type: string }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        login: { type: string }
+        fullName: { type: string }
+        email: { type: string, nullable: true }
+        role: { type: string }
+        isActive: { type: boolean }
+        blockedAt: { type: string, format: date-time, nullable: true }
+
+    ApplicationLine:
+      type: object
+      properties:
+        id: { type: string }
+        lineId: { type: string }
+        name: { type: string }
+        quantity: { type: number }
+        unit: { type: string }
+        price: { type: number, nullable: true }
+        complexity: { type: string, nullable: true }
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Параметры позиции. Признак `requiresKo` определяет обязательность
+            заключения КО для MODIFIED и вычисляется на сервере.
+
+    Application:
+      type: object
+      properties:
+        id: { type: string }
+        number: { type: string }
+        stage: { type: string }
+        complexity: { type: string }
+        ownerId: { type: string }
+        source: { type: string }
+        lockVersion: { type: integer }
+        versionNo: { type: integer }
+        createdAt: { type: string, format: date-time }
+        organization: { $ref: '#/components/schemas/Organization' }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/ApplicationLine' }
+
+    ApplicationCreate:
+      type: object
+      required: [organizationName]
+      properties:
+        organizationName: { type: string }
+        inn: { type: string, nullable: true }
+        kpp: { type: string, nullable: true }
+        contactName: { type: string, nullable: true }
+        contactPhone: { type: string, nullable: true }
+        contactEmail: { type: string, nullable: true }
+        externalNumber: { type: string, nullable: true }
+        source: { type: string }
+        priority: { type: string, enum: [LOW, NORMAL, HIGH, URGENT] }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineId: { type: string }
+              name: { type: string }
+              quantity: { type: number }
+              unit: { type: string }
+              price: { type: number, nullable: true }
+              complexity: { type: string, nullable: true }
+
+    ApplicationUpdate:
+      type: object
+      required: [lockVersion]
+      properties:
+        lockVersion: { type: integer }
+        contactName: { type: string }
+        contactPhone: { type: string }
+        contactEmail: { type: string }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/ApplicationLine' }
+
+    ApplicationCreateResult:
+      type: object
+      properties:
+        application: { $ref: '#/components/schemas/Application' }
+        deduplicated: { type: boolean, description: true, если заявка уже существовала по этому ключу }
+
+    PagedApplications:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Application' }
+        total: { type: integer }
+        page: { type: integer }
+        size: { type: integer }
+
+    Organization:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        inn: { type: string, nullable: true }
+
+    TimelineEvent:
+      type: object
+      properties:
+        at: { type: string, format: date-time }
+        kind: { type: string }
+        title: { type: string }
+        actorName: { type: string, nullable: true }
+        from: { type: string, nullable: true }
+        to: { type: string, nullable: true }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        applicationId: { type: string }
+        title: { type: string }
+        status: { type: string }
+        assigneeId: { type: string, nullable: true }
+        dueAt: { type: string, format: date-time, nullable: true }
+        lockVersion: { type: integer }
+
+    Activity:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string }
+        body: { type: string }
+        isCustomerFacing: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    Quote:
+      type: object
+      properties:
+        id: { type: string }
+        versionNo: { type: integer }
+        source: { type: string, enum: [GENERATED, UPLOADED] }
+        status: { type: string }
+        approvalStatus: { type: string }
+        amount: { type: number, nullable: true }
+        currency: { type: string, nullable: true }
+        validUntil: { type: string, format: date-time, nullable: true }
+        approvalFingerprint: { type: string, nullable: true }
+        lockVersion: { type: integer }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineId: { type: string }
+              name: { type: string }
+              quantity: { type: number }
+              price: { type: number }
+
+    CheckResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        blockers:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+        detail:
+          type: object
+          additionalProperties: true
+
+    EngineeringTask:
+      type: object
+      properties:
+        id: { type: string }
+        applicationId: { type: string }
+        status: { type: string }
+        assigneeId: { type: string, nullable: true }
+        conclusionDecision: { type: string, nullable: true }
+
+    Fulfilment:
+      type: object
+      properties:
+        shippedQuantity: { type: number }
+        remainingQuantity: { type: number }
+        paidAmount: { type: number }
+        openInvoices: { type: integer }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineId: { type: string }
+              ordered: { type: number }
+              shipped: { type: number }
+              remaining: { type: number }
+
+    ClosingDocument:
+      type: object
+      properties:
+        id: { type: string }
+        documentType: { type: string }
+        documentNumber: { type: string, nullable: true }
+        status: { type: string, enum: [REGISTERED, SIGNED] }
+
+    ImportRow:
+      type: object
+      properties:
+        rowNo: { type: integer }
+        groupId: { type: string }
+        organizationName: { type: string }
+        inn: { type: string, nullable: true }
+        lineName: { type: string }
+        quantity: { type: number }
+        unit: { type: string, nullable: true }
+        price: { type: number, nullable: true }
+
+    ImportIssue:
+      type: object
+      properties:
+        rowNo: { type: integer }
+        field: { type: string }
+        reason: { type: string }
+        fix: { type: string }
+
+    ImportInspect:
+      type: object
+      properties:
+        fileName: { type: string }
+        contentType: { type: string }
+        headers:
+          type: array
+          items: { type: string }
+        sample:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rowCount: { type: integer }
+        limit: { type: integer }
+
+    ImportBatch:
+      type: object
+      properties:
+        id: { type: string }
+        sourceKey: { type: string }
+        fileName: { type: string }
+        fileChecksum: { type: string }
+        externalBatchId:
+          type: string
+          nullable: true
+          description: Ранее принятый пакет с тем же содержимым, если это повтор.
+        status: { type: string, enum: [VALIDATED, COMMITTED, FAILED] }
+        totalRows: { type: integer }
+        validGroups: { type: integer }
+        errorGroups: { type: integer }
+        createdGroups: { type: integer, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    ImportPreview:
+      type: object
+      properties:
+        batch: { $ref: '#/components/schemas/ImportBatch' }
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/ImportIssue' }
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              groupId: { type: string }
+              rows: { type: integer }
+              organizationName: { type: string }
+              inn: { type: string, nullable: true }
+              totalQty: { type: number }
+              totalAmount: { type: number }
+              duplicateHint: { type: string, nullable: true }
+
+    ImportCommitResult:
+      type: object
+      properties:
+        batch: { $ref: '#/components/schemas/ImportBatch' }
+        created:
+          type: array
+          items:
+            type: object
+            properties:
+              groupId: { type: string }
+              number: { type: string }
+              deduplicated: { type: boolean }
+        failed:
+          type: array
+          items:
+            type: object
+            properties:
+              groupId: { type: string }
+              reason: { type: string }
+
+    OutboxEvent:
+      type: object
+      properties:
+        id: { type: string }
+        eventType: { type: string }
+        objectType: { type: string }
+        extId: { type: string }
+        state: { type: string }
+        attempts: { type: integer }
+        createdAt: { type: string, format: date-time }
+        ageSeconds: { type: integer }
+
+    InboundMail:
+      type: object
+      properties:
+        id: { type: string }
+        messageId: { type: string }
+        from: { type: string }
+        subject: { type: string }
+        parseState: { type: string, enum: [PENDING, PROCESSED, IGNORED] }
+        receivedAt: { type: string, format: date-time }
+
+    Dashboard:
+      type: object
+      properties:
+        counters:
+          type: object
+          additionalProperties: true
+        tasks:
+          type: object
+          additionalProperties:
+            type: integer
+        pipeline:
+          type: array
+          items:
+            type: object
+            properties:
+              stage: { type: string }
+              count: { type: integer }
+              amounts:
+                type: object
+                additionalProperties: { type: number }
+
+    Pipeline:
+      type: object
+      properties:
+        stages:
+          type: array
+          items:
+            type: object
+            properties:
+              stage: { type: string }
+              count: { type: integer }
+              amounts:
+                type: object
+                additionalProperties: { type: number }
+
+    PlanFact:
+      type: object
+      properties:
+        plan:
+          type: object
+          additionalProperties: { type: number }
+        fact:
+          type: object
+          additionalProperties: { type: number }
+        paidByCurrency:
+          type: object
+          additionalProperties: { type: number }
+          description: Суммы оплат по валютам; валюты не суммируются.
+
+    SlaRule:
+      type: object
+      properties:
+        id: { type: string }
+        stage: { type: string }
+        durationHours: { type: integer }
+        usesBusinessHours: { type: boolean }
+        remindBeforeMinutes: { type: integer }
+        pauseOnCustomerWait: { type: boolean }
+        active: { type: boolean }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string, nullable: true }
+        isRead: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        dedupKey: { type: string, nullable: true }
+
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        actionCode: { type: string }
+        entityType: { type: string }
+        entityId: { type: string }
+        applicationId: { type: string, nullable: true }
+        actorLogin: { type: string, nullable: true }
+        beforeJson:
+          type: object
+          additionalProperties: true
+          nullable: true
+        afterJson:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    FileObject:
+      type: object
+      properties:
+        id: { type: string }
+        fileName: { type: string }
+        contentType: { type: string }
+        sizeBytes: { type: integer }
+        applicationId: { type: string, nullable: true }
+        uploadedAt: { type: string, format: date-time }
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,149 @@
+import type { Tx } from '../errors.js';
+import { prisma } from './prisma.js';
+import type { Principal } from '../domain/scope.js';
+
+export interface AuditInput {
+  actor?: Principal | { id: string; login: string } | null;
+  /** Системная учётная запись интеграции. */
+  serviceAccount?: string;
+  actionCode: string;
+  entityType: string;
+  entityId: string;
+  applicationId?: string | null;
+  payload?: Record<string, unknown>;
+  before?: Record<string, unknown> | null;
+  after?: Record<string, unknown> | null;
+  correlationId: string;
+  /** Обязательно для административных специальных операций (RBAC-05, GATE-04). */
+  userReason?: string | null;
+  ip?: string | null;
+}
+
+type Client = Tx | typeof prisma;
+
+/**
+ * Технический аудит §14.2. Бизнес-хронология и технический журнал разделены:
+ * пользователь не может редактировать события через бизнес-интерфейс.
+ */
+export async function audit(client: Client, input: AuditInput): Promise<void> {
+  const actorId = input.actor && 'id' in input.actor ? input.actor.id : null;
+  const actorLogin = input.actor && 'login' in input.actor ? input.actor.login : null;
+  await client.auditEvent.create({
+    data: {
+      actorUserId: actorId,
+      actorLogin: actorLogin ?? input.serviceAccount ?? null,
+      actionCode: input.actionCode,
+      entityType: input.entityType,
+      entityId: String(input.entityId),
+      applicationId: input.applicationId ?? null,
+      payload: JSON.stringify(input.payload ?? {}),
+      beforeJson: input.before ? JSON.stringify(input.before) : null,
+      afterJson: input.after ? JSON.stringify(input.after) : null,
+      correlationId: input.correlationId,
+      userReason: input.userReason ?? null,
+      ip: input.ip ?? null,
+    },
+  });
+}
+
+export const AuditAction = {
+  LOGIN_SUCCESS: 'AUTH_LOGIN_SUCCESS',
+  LOGIN_FAILED: 'AUTH_LOGIN_FAILED',
+  LOGIN_BLOCKED: 'AUTH_LOGIN_BLOCKED',
+  LOGOUT: 'AUTH_LOGOUT',
+  PASSWORD_RESET: 'AUTH_PASSWORD_RESET',
+
+  APPLICATION_CREATE: 'APPLICATION_CREATE',
+  APPLICATION_UPDATE: 'APPLICATION_UPDATE',
+  APPLICATION_STAGE_CHANGE: 'APPLICATION_STAGE_CHANGE',
+  APPLICATION_ASSIGN: 'APPLICATION_ASSIGN',
+  APPLICATION_REASSIGN: 'APPLICATION_REASSIGN',
+  APPLICATION_COMPLEXITY_CHANGE: 'APPLICATION_COMPLEXITY_CHANGE',
+  APPLICATION_CANCEL: 'APPLICATION_CANCEL',
+  APPLICATION_ARCHIVE: 'APPLICATION_ARCHIVE',
+  APPLICATION_ADMIN_DELETE: 'APPLICATION_ADMIN_DELETE',
+  APPLICATION_ADMIN_STAGE_OVERRIDE: 'APPLICATION_ADMIN_STAGE_OVERRIDE',
+
+  CONTACT_CREATE: 'CONTACT_CREATE',
+  CONTACT_UPDATE: 'CONTACT_UPDATE',
+  ORGANIZATION_CREATE: 'ORGANIZATION_CREATE',
+  ORGANIZATION_UPDATE: 'ORGANIZATION_UPDATE',
+  ORGANIZATION_MERGE_SUGGESTED: 'ORGANIZATION_DUPLICATE_SUGGESTED',
+
+  TASK_CREATE: 'TASK_CREATE',
+  TASK_UPDATE: 'TASK_UPDATE',
+  TASK_COMPLETE: 'TASK_COMPLETE',
+  TASK_CANCEL: 'TASK_CANCEL',
+  TASK_COMPLETED_BY_OTHER: 'TASK_COMPLETED_BY_OTHER',
+
+  ACTIVITY_REGISTER: 'ACTIVITY_REGISTER',
+  ACTIVITY_CORRECT: 'ACTIVITY_CORRECT',
+
+  QUOTE_CREATE: 'QUOTE_CREATE',
+  QUOTE_UPDATE: 'QUOTE_UPDATE',
+  QUOTE_GENERATE: 'QUOTE_GENERATE',
+  QUOTE_UPLOAD: 'QUOTE_UPLOAD',
+  QUOTE_SUBMIT_APPROVAL: 'QUOTE_SUBMIT_APPROVAL',
+  QUOTE_APPROVE: 'QUOTE_APPROVE',
+  QUOTE_REJECT: 'QUOTE_REJECT',
+  QUOTE_INVALIDATE: 'QUOTE_INVALIDATE',
+  QUOTE_SEND: 'QUOTE_SEND',
+  QUOTE_EXTERNAL_SEND: 'QUOTE_EXTERNAL_SEND',
+  QUOTE_MAIL_RESULT: 'QUOTE_MAIL_RESULT',
+  QUOTE_CUSTOMER_DECISION: 'QUOTE_CUSTOMER_DECISION',
+  QUOTE_SUPERSEDE: 'QUOTE_SUPERSEDE',
+  QUOTE_ACTIVE_BASIS_SET: 'QUOTE_ACTIVE_BASIS_SET',
+
+  ENG_TASK_CREATE: 'ENG_TASK_CREATE',
+  ENG_TASK_ASSIGN: 'ENG_TASK_ASSIGN',
+  ENG_TASK_STATUS: 'ENG_TASK_STATUS',
+  ENG_CONCLUSION_CREATE: 'ENG_CONCLUSION_CREATE',
+  ENG_CONCLUSION_APPROVE: 'ENG_CONCLUSION_APPROVE',
+  ENG_CONCLUSION_INVALIDATE: 'ENG_CONCLUSION_INVALIDATE',
+  ENG_TASK_CANCEL: 'ENG_TASK_CANCEL',
+
+  COMMERCIAL_UPDATE: 'COMMERCIAL_UPDATE',
+  CONTRACT_SIGN: 'CONTRACT_SIGN',
+  CONTRACT_AMEND: 'CONTRACT_AMEND',
+  RELEASE_APPROVE: 'RELEASE_APPROVE',
+  RELEASE_REVOKE: 'RELEASE_REVOKE',
+  PRODUCTION_RELEASE: 'PRODUCTION_RELEASE',
+  PRODUCTION_RELEASE_ADMIN_OVERRIDE: 'PRODUCTION_RELEASE_ADMIN_OVERRIDE',
+  PRODUCTION_STAGE_UPDATE: 'PRODUCTION_STAGE_UPDATE',
+  PAYMENT_ALLOCATE: 'PAYMENT_ALLOCATE',
+  INVOICE_IMPORT: 'INVOICE_IMPORT',
+  SHIPMENT_IMPORT: 'SHIPMENT_IMPORT',
+  INTEGRATION_DELIVERY: 'INTEGRATION_DELIVERY',
+  CLOSING_DOC_UPDATE: 'CLOSING_DOC_UPDATE',
+  APPLICATION_CLOSE: 'APPLICATION_CLOSE',
+  APPLICATION_CLOSE_REOPENED: 'APPLICATION_CLOSE_REOPENED',
+
+  MAIL_RECEIVED: 'MAIL_RECEIVED',
+  MAIL_INBOX_CREATE_APP: 'MAIL_INBOX_CREATE_APP',
+  MAIL_INBOX_LINK: 'MAIL_INBOX_LINK',
+  MAIL_INBOX_IGNORE: 'MAIL_INBOX_IGNORE',
+
+  IMPORT_VALIDATE: 'IMPORT_VALIDATE',
+  IMPORT_COMMIT: 'IMPORT_COMMIT',
+  IMPORT_DUPLICATE_BLOCKED: 'IMPORT_DUPLICATE_BLOCKED',
+
+  SLA_RULE_UPDATE: 'SLA_RULE_UPDATE',
+  SLA_BREACH: 'SLA_BREACH',
+  SLA_PAUSE: 'SLA_PAUSE',
+  SLA_RESUME: 'SLA_RESUME',
+  CALENDAR_UPDATE: 'CALENDAR_UPDATE',
+  REFERENCE_UPDATE: 'REFERENCE_UPDATE',
+
+  USER_CREATE: 'ADMIN_USER_CREATE',
+  USER_UPDATE: 'ADMIN_USER_UPDATE',
+  USER_BLOCK: 'ADMIN_USER_BLOCK',
+  USER_UNBLOCK: 'ADMIN_USER_UNBLOCK',
+
+  SYNC_OUTBOX_ENQUEUE: 'SYNC_OUTBOX_ENQUEUE',
+  SYNC_OUT_DELIVER: 'SYNC_OUT_DELIVER',
+  SYNC_OUT_FAIL: 'SYNC_OUT_FAIL',
+  SYNC_IN_PROCESS: 'SYNC_IN_PROCESS',
+  SYNC_IN_STALE_SKIPPED: 'SYNC_IN_STALE_SKIPPED',
+  SYNC_CONFLICT: 'SYNC_CONFLICT',
+  SYNC_RECONCILE: 'SYNC_RECONCILE',
+} as const;

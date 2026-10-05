@@ -1,0 +1,888 @@
+// UNIPROM CRM R1 — data model per TZ v2.0 §13.1 / §4 / §7
+// SQLite for local run; provider is switched to postgresql via PRISMA_PROVIDER (see prisma/README note in docs/).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────── identity & access (SEC-01, RBAC-01..05)
+
+model User {
+  id           String    @id @default(cuid())
+  login        String    @unique
+  email        String?   @unique
+  fullName     String
+  passwordHash String
+  role         String // ADMIN | SALES_MANAGER | SALES | DESIGN_MANAGER | DESIGNER | PRODUCTION | VIEWER
+  isActive     Boolean   @default(true)
+  blockedAt    DateTime?
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  lockVersion  Int       @default(0)
+
+  // designated: applications where this user is the responsible SALES
+  ownedApplications Application[]     @relation("ApplicationOwner")
+  assignedTasks      CrmTask[]        @relation("TaskAssignee")
+  authoredTasks      CrmTask[]        @relation("TaskAuthor")
+  activities         CrmActivity[]    @relation("ActivityAuthor")
+  quotes             CrmQuote[]       @relation("QuoteAuthor")
+  quoteApprovals     CrmQuoteApproval[] @relation("QuoteApprovalRequester")
+  quoteApprovalDecisions CrmQuoteApproval[] @relation("QuoteApprovalDecider")
+  dispatches         CrmQuoteDispatch[]
+  engTasksAssigned   EngineeringTask[] @relation("EngAssignee")
+  engTasksCreated    EngineeringTask[] @relation("EngCreator")
+  engConclusions     EngineeringConclusion[] @relation("EngConclusionAuthor")
+  engApproved        EngineeringConclusion[] @relation("EngConclusionApprover")
+  notifications      Notification[]
+  auditEvents        AuditEvent[]
+  manualReleases     ProductionRelease[] @relation("ReleaseManualApprover")
+  releaseApprovals   ReleaseApproval[]  @relation("ReleaseApprovalActor")
+  files              StoredFile[]
+  slaPauses          SlaPause[]
+  reassignedFrom     AssignmentHistory[] @relation("AssignmentFrom")
+  reassignedTo       AssignmentHistory[] @relation("AssignmentTo")
+  importBatches      ImportBatch[]
+
+  @@index([role, isActive])
+}
+
+// ─────────────────────────────────────────── core: organizations & contacts (RBAC-02)
+
+model Organization {
+  id            String    @id @default(cuid())
+  name          String
+  fullName      String?
+  inn           String?
+  kpp           String?
+  normalizedKey String    @unique // INN+KPP or normalized name
+  website       String?
+  industry      String?
+  address       String?
+  extSystem     String?
+  extId         String?
+  isArchived    Boolean   @default(false)
+  ownerId       String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lockVersion   Int       @default(0)
+
+  contacts     Contact[]
+  applications Application[]
+}
+
+model Contact {
+  id             String    @id @default(cuid())
+  organizationId String
+  fullName       String
+  position       String?
+  phone          String?
+  phoneNormalized String?
+  email          String?
+  emailNormalized String?
+  preferredChannel String? // EMAIL | PHONE | MESSENGER
+  isPrimary      Boolean   @default(false)
+  isArchived     Boolean   @default(false)
+  extSystem      String?
+  extId          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lockVersion    Int       @default(0)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  applications Application[]
+
+  @@unique([organizationId, phoneNormalized])
+  @@index([emailNormalized])
+}
+
+// ─────────────────────────────────────────── core.applications (APP-01..04)
+
+model Application {
+  id             String    @id @default(cuid())
+  number         String    @unique // human-readable, immutable
+  stage          String    @default("NEW") // 16 stages, §7.1
+  legacyStatus   String? // PAYMENT_PENDING / PAID preserved on migration (§7.2)
+  organizationId String
+  contactId      String?
+  ownerId        String? // SALES
+  source         String    @default("MANUAL") // SELECTOR | MANUAL | EMAIL | IMPORT
+  sourceRef      String?
+  priority       String    @default("NORMAL") // LOW | NORMAL | HIGH
+  complexity     String    @default("NEEDS_CLASSIFICATION") // STANDARD|MODIFIED|CUSTOM|NEEDS_CLASSIFICATION
+  complexityConfirmedById String?
+  complexityConfirmedAt   DateTime?
+  successProbability Int? // 0..100
+  expectedDecisionDate DateTime?
+  amount             Float? // summary of the single active accepted quote
+  currency           String? 
+  tags               String    @default("[]") // JSON array
+  crmComment         String?
+  lossReason         String? // PRICE|DELIVERY_TIME|...
+  lossComment        String?
+  engineQuestions    String? // technical input snapshot (JSON)
+  lastActivityAt     DateTime?
+  lastCustomerContactAt DateTime?
+  nextActivityAt     DateTime?
+  isClosed          Boolean   @default(false)
+  closedAt          DateTime?
+  closedById        String?
+  closeReopenedAt   DateTime?
+  closeReopenReason String?
+  externalNumber    String?
+  parentApplicationId String? // related applications / same enquiry (APP-03)
+  linkedDuplicateId String?
+  idempotencyKey    String?   @unique
+  isDraft           Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lockVersion    Int       @default(0)
+  versionNo      Int       @default(1) // snapshot of technical parameters revision
+
+  organization  Organization @relation(fields: [organizationId], references: [id])
+  contact       Contact?     @relation(fields: [contactId], references: [id])
+  owner         User?        @relation("ApplicationOwner", fields: [ownerId], references: [id])
+
+  lines          ApplicationLine[]
+  tasks          CrmTask[]
+  activities     CrmActivity[]
+  quotes         CrmQuote[]
+  engTasks       EngineeringTask[]
+  commercial     ApplicationCommercial?
+  payments       PaymentAllocation[]
+  shipments      Shipment[]
+  closingDocs    ClosingDocument[]
+  fileLinks      ApplicationFile[]
+  activitiesLog  AuditEvent[]
+  releases       ProductionRelease[]
+  assignmentHistory AssignmentHistory[]
+  slaInstances   SlaInstance[]
+  mailMessages   MailMessage[]
+  integrationLinks IntegrationLink[]
+  importBatchId  String?
+
+  @@index([stage])
+  @@index([ownerId, stage])
+  @@index([organizationId])
+  @@index([lastActivityAt])
+  @@index([nextActivityAt])
+  @@index([source, createdAt])
+}
+
+model ApplicationLine {
+  id             String   @id @default(cuid())
+  applicationId  String
+  lineId         String // permanent integration identifier (APP-02), never the display row number
+  name           String
+  quantity       Float    @default(1)
+  unit           String   @default("шт.")
+  catalogRef     String?
+  price          Float?
+  currency       String?
+  complexity     String? // per-line level
+  params         String   @default("{}") // technical parameters JSON
+  calculationRevision String?
+  shippedQty     Float    @default(0) // confirmed shipments (denormalised for list views)
+  orderQty       Float    @default(1) // current effective ordered quantity
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  lockVersion    Int      @default(0)
+
+  application Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, lineId])
+}
+
+model AssignmentHistory {
+  id            String   @id @default(cuid())
+  applicationId String
+  fromUserId    String?
+  toUserId      String?
+  movedOpenTasks Boolean  @default(false)
+  comment       String?
+  actorId       String
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fromUser    User?       @relation("AssignmentFrom", fields: [fromUserId], references: [id])
+  toUser      User?       @relation("AssignmentTo", fields: [toUserId], references: [id])
+}
+
+// ─────────────────────────────────────────── tasks & activities (§10.1)
+
+model CrmTask {
+  id             String    @id @default(cuid())
+  applicationId  String
+  type           String    @default("TASK") // CALL|EMAIL|MEETING|TASK|FOLLOW_UP|OTHER
+  subject        String
+  description    String?
+  authorId       String
+  assigneeId     String
+  dueAt          DateTime
+  status         String    @default("OPEN") // OPEN|DONE|CANCELLED
+  priority       String    @default("NORMAL")
+  contactId      String?
+  reminderAt     DateTime?
+  completedAt    DateTime?
+  completedById  String?
+  cancelReason   String?
+  result         String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lockVersion    Int       @default(0)
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  assignee    User        @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  author      User        @relation("TaskAuthor", fields: [authorId], references: [id])
+
+  @@index([assigneeId, status, dueAt])
+  @@index([applicationId])
+}
+
+model CrmActivity {
+  id             String    @id @default(cuid())
+  applicationId  String
+  type           String // CALL|EMAIL|MEETING|NOTE|SYSTEM
+  direction      String? // IN|OUT
+  participants   String    @default("[]") // JSON
+  occurredAt     DateTime
+  registeredAt   DateTime  @default(now())
+  authorId       String
+  subject        String?
+  content        String?
+  result         String?
+  isCustomerFacing Boolean  @default(true) // technical polls must not refresh commercial activity (§10.1)
+  previousContent String? // correction keeps prior value
+  correctedById  String?
+  createdAt      DateTime  @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  author      User        @relation("ActivityAuthor", fields: [authorId], references: [id])
+
+  @@index([applicationId, occurredAt])
+  @@index([occurredAt])
+}
+
+// ─────────────────────────────────────────── quotes (QUOTE-01..08, SEND-01..06)
+
+model CrmQuote {
+  id             String    @id @default(cuid())
+  applicationId  String
+  versionNo      Int
+  number         String
+  status         String    @default("DRAFT") // DRAFT|READY|SENT|ACCEPTED|REJECTED|SUPERSEDED
+  approvalStatus String    @default("NOT_REQUESTED") // NOT_REQUESTED|PENDING|APPROVED|REJECTED|INVALIDATED
+  source         String    @default("GENERATED") // GENERATED|UPLOADED
+  authorId       String
+  amount         Float?
+  currency       String?
+  discountPct    Float     @default(0)
+  taxAttribute   String    @default("NDS_20")
+  validUntil     DateTime?
+  leadTimeDays   Int?
+  deliveryTerms  String?
+  paymentTermsNote String?
+  technicalNotes String?
+  conditionsNote String? // must reflect KO conclusion (ENG-06)
+  calculationRevision String?
+  engineeringRevision  String?
+  templateVersion String?
+  // content fingerprint of the approvable snapshot (QUOTE-06/07)
+  contentHash    String?
+  fileId         String? // approved document (immutable once SENT)
+  fileName       String?
+  fileChecksum   String?
+  approvalSnapshot String? // JSON frozen at submit-approval
+  origin         String? // MIGRATED_LEGACY (§MIG-04)
+  isActiveBasis  Boolean   @default(false) // single active accepted version (QUOTE-08)
+  isLegacySent   Boolean   @default(false)
+  sentAt         DateTime?
+  customerDecision String? // ACCEPTED|REJECTED|...
+  customerDecisionAt DateTime?
+  customerDecisionNote String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lockVersion    Int       @default(0)
+
+  application  Application        @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  author       User                @relation("QuoteAuthor", fields: [authorId], references: [id])
+  lines        CrmQuoteLine[]
+  approvals    CrmQuoteApproval[]
+  dispatches   CrmQuoteDispatch[]
+
+  @@unique([applicationId, versionNo])
+  @@index([applicationId, status])
+}
+
+model CrmQuoteLine {
+  id         String  @id @default(cuid())
+  quoteId    String
+  lineId     String  // FK to ApplicationLine.lineId
+  name       String
+  quantity   Float
+  unit       String
+  price      Float
+  amount     Float
+  params     String  @default("{}")
+
+  quote CrmQuote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+}
+
+model CrmQuoteApproval {
+  id          String   @id @default(cuid())
+  quoteId     String
+  requestedById String
+  requestedAt DateTime @default(now())
+  decidedById String?
+  decidedAt   DateTime?
+  decision    String? // APPROVED|REJECTED
+  comment     String?
+  versionFingerprint String? // hash of the approved snapshot
+  superseded  Boolean  @default(false)
+  invalidatedReason String?
+
+  quote       CrmQuote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  requestedBy User     @relation("QuoteApprovalRequester", fields: [requestedById], references: [id])
+  decidedBy   User?    @relation("QuoteApprovalDecider", fields: [decidedById], references: [id])
+}
+
+model CrmQuoteDispatch {
+  id          String   @id @default(cuid())
+  quoteId     String
+  channel     String   // CRM_MAIL | EXTERNAL_MANUAL
+  recipients  String   // JSON array
+  subject     String?
+  body        String?
+  initiatedById String
+  sentAt      DateTime?
+  actualDateTime DateTime? // for manual external registration
+  providerMessageId String?
+  queueState  String? // QUEUED|PROCESSING|SENT|FAILED|UNKNOWN
+  errorText   String?
+  isManual    Boolean  @default(false)
+  idempotencyKey String? @unique
+  // A19: доставка с повторами. Слепой повтор после неопределённого результата
+  // не выполняется — такие задания переходят в UNKNOWN и ждут решения человека.
+  attempts    Int      @default(0)
+  nextAttemptAt DateTime @default(now())
+  lastAttemptAt DateTime?
+  createdAt   DateTime @default(now())
+
+  quote       CrmQuote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  initiatedBy User     @relation(fields: [initiatedById], references: [id])
+
+  @@index([quoteId, createdAt])
+  @@index([queueState])
+  @@index([queueState, nextAttemptAt])
+}
+
+// ─────────────────────────────────────────── engineering (§6)
+
+model EngineeringTask {
+  id             String    @id @default(cuid())
+  applicationId  String
+  kind           String    // PREQUOTE | ORDER_DESIGN
+  status         String    @default("NEW") // NEW|ASSIGNED|IN_PROGRESS|WAITING_INPUT|COMPLETED|CANCELLED
+  assigneeId     String?
+  createdById    String
+  priority       String    @default("NORMAL")
+  dueAt          DateTime?
+  questions      String?
+  inputSnapshot  String    @default("{}") // frozen source data + revision
+  inputRevision  String?
+  initiatedAt    DateTime?
+  orderDesignLinkedQuoteId String?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lockVersion    Int       @default(0)
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  assignee      User?       @relation("EngAssignee", fields: [assigneeId], references: [id])
+  createdBy     User        @relation("EngCreator", fields: [createdById], references: [id])
+  conclusions   EngineeringConclusion[]
+
+  @@index([status, kind, assigneeId])
+  @@index([applicationId])
+}
+
+model EngineeringConclusion {
+  id             String    @id @default(cuid())
+  engineeringTaskId String
+  applicationId  String
+  decision       String    // FEASIBLE|FEASIBLE_WITH_CONDITIONS|NEED_DATA|NOT_FEASIBLE
+  conditions     String?
+  technicalExecution String?
+  priceInputs    String?   // source data for price & lead time
+  leadTimeDays   Int?
+  validForRevision String  // conclusion acts only for this parameter revision (ENG-05)
+  authorId       String
+  approvedById   String?
+  approvedAt     DateTime?
+  isValid        Boolean   @default(true)
+  invalidatedReason String?
+  createdAt      DateTime  @default(now())
+
+  engineeringTask EngineeringTask @relation(fields: [engineeringTaskId], references: [id], onDelete: Cascade)
+  author          User             @relation("EngConclusionAuthor", fields: [authorId], references: [id])
+  approvedBy      User?            @relation("EngConclusionApprover", fields: [approvedById], references: [id])
+
+  @@index([applicationId, isValid])
+}
+
+// ─────────────────────────────────────────── commercial & gate (§9)
+
+model ApplicationCommercial {
+  id                String    @id @default(cuid())
+  applicationId     String    @unique
+  contractNumber    String?
+  contractDate      DateTime?
+  contractStatus    String    @default("DRAFT") // DRAFT|SIGNED|TERMINATED
+  contractFileId    String?
+  contractSignedAt  DateTime?
+  specificationRef  String?
+  basisQuoteId      String? // accepted commercial basis
+  basisAmount       Float?
+  basisCurrency     String?
+  paymentTerms      String? // PREPAYMENT_100|PREPAYMENT_PARTIAL|POSTPAYMENT|CUSTOM|NOT_SET
+  paymentSchedule   String    @default("[]") // JSON [{stage, pct, dueDays}]
+  deliveryTerms     String?
+  versionNo         Int       @default(1) // contract terms version (GATE-02)
+  syncedTo1C        Boolean   @default(false)
+  updatedAt         DateTime  @updatedAt
+  lockVersion       Int       @default(0)
+
+  application    Application         @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  invoices       Invoice[]
+  releaseApproval ReleaseApproval?
+}
+
+model Invoice {
+  id             String   @id @default(cuid())
+  commercialId   String
+  extSystem      String   @default("ONE_C")
+  extId          String
+  number         String
+  docDate        DateTime?
+  amount         Float
+  currency       String
+  status         String   // NEW|PARTIAL|PAID|CANCELLED
+  isPosted       Boolean  @default(true)
+  versionNo      Int      @default(1)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  commercial  ApplicationCommercial @relation(fields: [commercialId], references: [id], onDelete: Cascade)
+  allocations PaymentAllocation[]
+
+  @@unique([extSystem, extId])
+}
+
+model Payment {
+  id             String   @id @default(cuid())
+  extSystem      String   @default("ONE_C")
+  extId          String
+  docDate        DateTime?
+  amount         Float
+  currency       String
+  kind           String   @default("IN") // IN|RETURN
+  isPosted       Boolean  @default(true)
+  isCancelled    Boolean  @default(false)
+  versionNo      Int      @default(1)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  allocations PaymentAllocation[]
+
+  @@unique([extSystem, extId])
+}
+
+model PaymentAllocation {
+  id             String   @id @default(cuid())
+  paymentId      String
+  invoiceId      String?
+  applicationId  String
+  amount         Float    // only the allocated share counts toward the order
+  isCancelled    Boolean  @default(false)
+  comment        String?
+  createdAt      DateTime @default(now())
+
+  payment     Payment    @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoice     Invoice?   @relation(fields: [invoiceId], references: [id])
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+model ReleaseApproval {
+  id             String   @id @default(cuid())
+  commercialId   String   @unique
+  approved       Boolean  @default(false)
+  actorId        String
+  reason         String
+  termsVersionNo Int      // permission bound to contract terms version (GATE-02)
+  amountSnapshot Float?
+  orderHash      String?  // order composition hash
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  revokedAt      DateTime?
+
+  commercial ApplicationCommercial @relation(fields: [commercialId], references: [id], onDelete: Cascade)
+  actor      User                 @relation("ReleaseApprovalActor", fields: [actorId], references: [id])
+}
+
+model ProductionRelease {
+  id             String    @id @default(cuid())
+  applicationId  String
+  releasedById   String?
+  isManualOverride Boolean @default(false)
+  overrideReason String?
+  termsVersionNo Int
+  state          String    @default("ACTIVE") // ACTIVE|COMPLETED|CANCELLED
+  releasedAt     DateTime  @default(now())
+  completedAt    DateTime?
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  manualApprover User?     @relation("ReleaseManualApprover", fields: [releasedById], references: [id])
+}
+
+// ─────────────────────────────────────────── fulfilment (§9.3)
+
+model Shipment {
+  id             String   @id @default(cuid())
+  applicationId  String
+  extSystem      String   @default("ONE_C")
+  extId          String
+  number         String
+  docDate        DateTime?
+  status         String   @default("NEW") // NEW|READY|CLOSED|CANCELLED
+  isPosted       Boolean  @default(true)
+  isCancelled    Boolean  @default(false)
+  carrier        String?
+  waybill        String?
+  versionNo      Int      @default(1)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  application Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  lines       ShipmentLine[]
+
+  @@unique([extSystem, extId])
+  @@index([applicationId])
+}
+
+model ShipmentLine {
+  id          String   @id @default(cuid())
+  shipmentId  String
+  lineId      String
+  quantity    Float
+  unit        String
+  actualDate  DateTime?
+  createdAt   DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  // lineId is a soft reference to ApplicationLine.lineId: an unmatched line from 1C must be
+  // reported as a discrepancy (SHIP-02), not rejected or silently zeroed.
+}
+
+model ClosingDocument {
+  id             String   @id @default(cuid())
+  applicationId  String
+  docType        String   // UPD|NAKLADNAYA|SF|ACT
+  isRequired     Boolean  @default(true)
+  requiresBothSignatures Boolean @default(false)
+  status         String   @default("PENDING") // PENDING|REGISTERED|SIGNED|CANCELLED
+  extSystem      String?
+  extId          String?
+  number         String?
+  registeredAt   DateTime?
+  fileId         String?
+  source         String   @default("ONE_C") // ONE_C|CRM
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+// ─────────────────────────────────────────── files (§13.1, §14.2)
+
+model StoredFile {
+  id            String   @id @default(cuid())
+  objectKey     String   @unique // path in the file storage abstraction
+  originalName  String
+  contentType   String
+  sizeBytes     Int
+  checksum      String
+  uploadedById  String?
+  createdAt     DateTime @default(now())
+
+  uploadedBy User?           @relation(fields: [uploadedById], references: [id])
+  links       ApplicationFile[]
+}
+
+// Assignment of a stored file to an application/business object (§13.1 «object_key»)
+model ApplicationFile {
+  id            String   @id @default(cuid())
+  applicationId String
+  fileId        String
+  purpose       String   @default("ATTACHMENT") // ATTACHMENT|QUOTE|CONTRACT|CLOSING_DOC|MAIL|ENG_REVISION
+  refId         String?  // e.g. quoteId / closingDocumentId
+  versionNo     Int      @default(1)
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  file        StoredFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, fileId, purpose, refId])
+  @@index([applicationId, purpose])
+}
+
+// ─────────────────────────────────────────── mail (§5.2, SEND-01..06)
+
+model MailMessage {
+  id            String   @id @default(cuid())
+  mailbox       String
+  messageId     String   @unique
+  inReplyTo     String?
+  references    String?
+  threadKey     String?
+  from          String
+  to            String
+  subject       String?
+  bodyText      String?
+  bodyHtml      String?  // sanitised
+  receivedAt    DateTime
+  direction     String   // IN|OUT
+  queueState    String?  // QUEUED|PROCESSING|SENT|FAILED|UNKNOWN
+  parseState    String   @default("PENDING") // PENDING|CREATED|LINKED|IGNORED
+  applicationId String?
+  errorText     String?
+  attachments   String   @default("[]") // JSON [{name, size, contentType, objectKey}]
+  createdAt     DateTime @default(now())
+
+  application Application? @relation(fields: [applicationId], references: [id])
+  linkedApplications String @default("[]") // candidate hints from email/number match
+
+  @@index([parseState, receivedAt])
+}
+
+// ─────────────────────────────────────────── import (§5.3)
+
+model ImportBatch {
+  id            String   @id @default(cuid())
+  fileName      String
+  fileChecksum  String
+  sourceKey     String   // 'EXCEL'|'CSV'
+  externalBatchId String?
+  status        String   @default("VALIDATED") // VALIDATED|COMMITTED|REJECTED
+  totalRows     Int      @default(0)
+  validGroups   Int      @default(0)
+  errorGroups   Int      @default(0)
+  createdGroups Int      @default(0)
+  errors        String   @default("[]") // JSON [{row, field, reason, fix}]
+  warnings      String   @default("[]")
+  mapping       String   @default("{}")
+  rows          String   @default("[]") // normalised rows kept for the confirm step (IMP-01)
+  createdById   String
+  createdAt     DateTime @default(now())
+  committedAt   DateTime?
+
+  createdBy User? @relation(fields: [createdById], references: [id])
+}
+
+// ─────────────────────────────────────────── SLA (§10.2)
+
+model SlaRule {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  name          String
+  stage         String?  // trigger point (§7.1)
+  complexity    String?
+  priority      String?
+  usesBusinessHours Boolean @default(true)
+  durationMinutes Int
+  remindBeforeMinutes Int @default(120)
+  escalationUserId String?
+  pauseOnCustomerWait Boolean @default(false)
+  versionNo     Int      @default(1)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model WorkCalendar {
+  id        String   @id @default(cuid())
+  name      String
+  timezone  String   @default("Asia/Yekaterinburg")
+  weekdays  String   @default("[1,2,3,4,5]") // 1=Monday
+  workStart String   @default("09:00")
+  workEnd   String   @default("18:00")
+  holidays  String   @default("[]") // JSON ["2026-01-01"]
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SlaInstance {
+  id             String    @id @default(cuid())
+  applicationId  String
+  ruleCode       String
+  dueAt          DateTime
+  startedAt      DateTime  @default(now())
+  originalDueAt  DateTime
+  status         String    @default("ACTIVE") // ACTIVE|MET|BREACHED|PAUSED|CANCELLED
+  pausedMs       Int       @default(0)
+  breachedAt     DateTime?
+  assigneeId     String?
+  stage          String?
+  complexity     String?
+  createdAt      DateTime  @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  pauses      SlaPause[]
+
+  @@index([status, dueAt])
+  @@index([applicationId])
+}
+
+model SlaPause {
+  id          String   @id @default(cuid())
+  slaInstanceId String
+  reason      String
+  awaiting    String?  // expected customer answer
+  nextCheckAt DateTime
+  startedById String
+  startedAt   DateTime @default(now())
+  endedAt     DateTime?
+
+  slaInstance SlaInstance @relation(fields: [slaInstanceId], references: [id], onDelete: Cascade)
+  startedBy   User        @relation(fields: [startedById], references: [id])
+}
+
+// ─────────────────────────────────────────── notifications, audit, reference (§10.3, §14.2)
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  code      String
+  title     String
+  body      String?
+  entityType String?
+  entityId  String?
+  dedupKey  String
+  isRead    Boolean   @default(false)
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupKey])
+  @@index([userId, isRead, createdAt])
+}
+
+model AuditEvent {
+  id            String   @id @default(cuid())
+  actorUserId   String?
+  actorLogin    String?  // or service account
+  actionCode    String
+  entityType    String
+  entityId      String
+  applicationId String?
+  payload       String   @default("{}")
+  beforeJson    String?
+  afterJson     String?
+  correlationId String
+  userReason    String?  // required for admin special operations (RBAC-05)
+  ip            String?
+  createdAt     DateTime @default(now())
+
+  actor       User?         @relation(fields: [actorUserId], references: [id])
+  application Application? @relation(fields: [applicationId], references: [id])
+
+  @@index([entityType, entityId, createdAt])
+  @@index([applicationId, createdAt])
+  @@index([actionCode, createdAt])
+}
+
+model ReferenceItem {
+  id        String   @id @default(cuid())
+  kind      String   // LOSS_REASON|ACTIVITY_TYPE|CURRENCY|UNIT|STAGE|TEMPLATE
+  code      String
+  label     String
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  meta      String   @default("{}")
+  createdAt DateTime @default(now())
+
+  @@unique([kind, code])
+}
+
+// ─────────────────────────────────────────── integration with 1C (§11, SYNC-01..08)
+
+model IntegrationLink {
+  id            String   @id @default(cuid())
+  system        String   // ONE_C
+  objectType    String   // ORDER|CONTRACT|COUNTERPARTY
+  extId         String
+  applicationId String?
+  versionNo     Int      @default(1)
+  lastEventAt   DateTime?
+  lastSyncedAt  DateTime?
+  state         String   @default("SYNCED") // SYNCED|PENDING|CONFLICT|ERROR
+  meta          String   @default("{}")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  application Application? @relation(fields: [applicationId], references: [id])
+
+  @@unique([system, objectType, extId])
+}
+
+model OutboxMessage {
+  id             String   @id @default(cuid())
+  system         String
+  objectType     String
+  extId          String
+  applicationId  String?
+  versionNo      Int      @default(1)
+  eventType      String
+  payload        String
+  idempotencyKey String   @unique
+  correlationId  String
+  state          String   @default("PENDING") // PENDING|DELIVERED|FAILED|ERROR_QUEUE
+  attempts       Int      @default(0)
+  nextAttemptAt  DateTime @default(now())
+  lastError      String?
+  createdAt      DateTime @default(now())
+  deliveredAt    DateTime?
+
+  @@index([state, nextAttemptAt])
+}
+
+model InboxMessage {
+  id          String   @id @default(cuid())
+  system      String
+  objectType  String
+  extId       String
+  versionNo   Int      @default(1)
+  eventType   String
+  payload     String
+  messageKey  String   @unique // dedup (SYNC-03)
+  correlationId String
+  state       String   @default("PENDING") // PROCESSED|SKIPPED_STALE|CONFLICT|ERROR
+  result      String?
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+
+  @@index([state, receivedAt])
+}
